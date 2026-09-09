@@ -357,6 +357,29 @@ st.write(
 db = cargar_metadatos()
 seleccion = seleccionar_pacientes(db)
 
+# ==========================================================
+# DESCARGA DEL DATASET COMPLETO EN CSV
+# ==========================================================
+
+st.sidebar.header("Dataset PTB-XL")
+
+@st.cache_data
+def obtener_dataset_completo():
+    url_dataset = "https://physionet.org/files/ptb-xl/1.0.3/ptbxl_database.csv"
+    dataset = pd.read_csv(url_dataset)
+    return dataset
+
+dataset_completo = obtener_dataset_completo()
+
+csv_dataset = dataset_completo.to_csv(index=False).encode("utf-8")
+
+st.sidebar.download_button(
+    label="⬇️ Descargar dataset completo CSV",
+    data=csv_dataset,
+    file_name="ptbxl_dataset_completo.csv",
+    mime="text/csv"
+)
+
 st.sidebar.header("Selección de paciente")
 
 grupo = st.sidebar.selectbox(
