@@ -483,20 +483,40 @@ def analizar_paciente(
 
 
 # ============================================================
-# 10. EJEMPLO DE USO
+# 10. EJEMPLOS DE USO
 # ============================================================
 
 if __name__ == "__main__":
-    print("Módulo de análisis ECG cargado correctamente.")
-    print("Para analizar una señal, llama a analizar_paciente(...) con la ruta real del archivo.")
-    # Ejemplo:
+
+    # ========================================================
+    # EJEMPLO 1: Si tu señal está en CSV
+    # ========================================================
+    # El CSV debe tener una columna llamada "ecg"
+    # o cambia columna_ecg por el nombre correcto.
+    #)
+    analizar_paciente(
+        ruta="paciente01.csv",
+         tipo_archivo="csv",
+         columna_ecg="ecg",
+         columna_tiempo=None,
+         fs=500,
+         sexo="Hombre",
+         edad=35,
+         condicion="Sano"
+     
+
+    # ========================================================
+    # EJEMPLO 2: Si tu señal está en formato WFDB
+    # ========================================================
+    # Para bases como MIT-BIH, PTB, PTB-XL, etc.
+    #
     # analizar_paciente(
-    #     ruta="paciente01.csv",
-    #     tipo_archivo="csv",
-    #     columna_ecg="ecg",
-    #     columna_tiempo=None,
-    #     fs=500,
-    #     sexo="Hombre",
-    #     edad=35,
-    #     condicion="Sano",
+    #     ruta="100",
+    #     tipo_archivo="wfdb",
+    #     canal=0,
+    #     sexo="Mujer",
+    #     edad=65,
+    #     condicion="Arritmia"
     # )
+
+    print("Código listo. Descomenta un ejemplo y coloca la ruta de tu señal ECG.")

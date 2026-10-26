@@ -27,65 +27,66 @@ st.set_page_config(
 # CARGA DE METADATOS
 # ==========================================================
 
-@st.cache_data(ttl=3600, show_spinner="Descargando metadatos de PTB-XL...")
+@st.cache_data(ttl=3600, show_spinner="Cargando metadatos locales de PTB-XL...")
 def cargar_metadatos():
-    """Descarga solo los dos CSV necesarios y falla con un mensaje claro."""
-    url_db = "https://physionet.org/files/ptb-xl/1.0.3/ptbxl_database.csv"
-    url_scp = "https://physionet.org/files/ptb-xl/1.0.3/scp_statements.csv"
+    """Carga el CSV local; no descarga metadatos desde PhysioNet."""
+    ruta_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ptbxl_dataset_completo.csv")
+
+    if not os.path.isfile(ruta_csv):
+        st.error(
+            "No se encontró ptbxl_dataset_completo.csv. "
+            "Coloca ese archivo en la misma carpeta que app_ecg_ptbxl.py."
+        )
+        st.stop()
 
     try:
-        with requests.Session() as session:
-            respuesta_db = session.get(url_db, timeout=(8, 25))
-            respuesta_db.raise_for_status()
-            respuesta_scp = session.get(url_scp, timeout=(8, 25))
-            respuesta_scp.raise_for_status()
-        db = pd.read_csv(io.BytesIO(respuesta_db.content), index_col="ecg_id")
-        scp = pd.read_csv(io.BytesIO(respuesta_scp.content), index_col=0)
-    except requests.RequestException as exc:
-        st.error(f"No se pudieron descargar los metadatos de PTB-XL: {exc}")
-        st.info("Comprueba tu conexión a Internet y que PhysioNet sea accesible. La descarga tiene un límite de tiempo; vuelve a ejecutar la aplicación cuando la conexión funcione.")
-        st.stop()
-    except (ValueError, pd.errors.ParserError) as exc:
-        st.error(f"No se pudieron interpretar los CSV de PTB-XL: {exc}")
+        db = pd.read_csv(ruta_csv, low_memory=False)
+    except Exception as e:
+        st.error(f"No se pudo leer el CSV local: {e}")
         st.stop()
 
-    db["scp_codes"] = db["scp_codes"].apply(ast.literal_eval)
+    requeridas = {"ecg_id", "patient_id", "age", "sex", "scp_codes", "filename_lr"}
+    faltantes = requeridas - set(db.columns)
+    if faltantes:
+        st.error("Al CSV le faltan columnas necesarias: " + ", ".join(sorted(faltantes)))
+        st.stop()
 
-    # Crear diccionario de clases diagnósticas
-    diagnostic_classes = {}
+    def parsear_codigos(valor):
+        if isinstance(valor, dict):
+            return valor
+        if pd.isna(valor) or not str(valor).strip():
+            return {}
+        try:
+            resultado = ast.literal_eval(str(valor))
+            return resultado if isinstance(resultado, dict) else {}
+        except (ValueError, SyntaxError):
+            return {}
 
-    for code in scp.index:
-        if scp.loc[code, "diagnostic"] == 1:
-            diagnostic_classes[code] = scp.loc[code, "diagnostic_class"]
+    db["scp_codes"] = db["scp_codes"].apply(parsear_codigos)
+    # El CSV contiene los códigos SCP pero no incluye scp_statements.csv,
+    # que es el archivo que mapea cada código a una clase diagnóstica.
+    # Para mantener los filtros Sano/Con afección usamos una regla explícita:
+    # NORM sin otros códigos distintos de SR se considera Sano; los demás
+    # registros con códigos se consideran Con afección. No es diagnóstico clínico.
+    db["diagnostic_classes"] = db["scp_codes"].apply(lambda d: list(d.keys()))
 
-    def obtener_clases(scp_dict):
-        clases = []
-        for code in scp_dict.keys():
-            if code in diagnostic_classes:
-                clases.append(diagnostic_classes[code])
-        return list(set(clases))
-
-    db["diagnostic_classes"] = db["scp_codes"].apply(obtener_clases)
-
-    def clasificar_condicion(clases):
-        if "NORM" in clases and len(clases) == 1:
+    def clasificar_condicion(codigos):
+        codigos = set(codigos.keys())
+        if "NORM" in codigos and codigos.issubset({"NORM", "SR"}):
             return "Sano"
-        elif len(clases) > 0:
+        if codigos:
             return "Con afección"
-        else:
-            return "No clasificado"
+        return "No clasificado"
 
-    db["condicion"] = db["diagnostic_classes"].apply(clasificar_condicion)
-
-    # En PTB-XL: 0 = Hombre, 1 = Mujer
-    db["sexo_texto"] = db["sex"].map({
-        0: "Hombre",
-        1: "Mujer"
-    })
-
+    db["condicion"] = db["scp_codes"].apply(clasificar_condicion)
+    db["sexo_texto"] = pd.to_numeric(db["sex"], errors="coerce").map({0: "Hombre", 1: "Mujer"})
+    db["age"] = pd.to_numeric(db["age"], errors="coerce")
+    db["patient_id"] = pd.to_numeric(db["patient_id"], errors="coerce")
+    db["ecg_id"] = pd.to_numeric(db["ecg_id"], errors="coerce")
+    db = db.dropna(subset=["ecg_id", "patient_id", "age", "sexo_texto"])
+    db = db.set_index("ecg_id", drop=False)
     db = db[(db["age"] >= 18) & (db["age"] <= 89)]
     db = db[db["condicion"].isin(["Sano", "Con afección"])]
-
     return db
 
 
@@ -132,32 +133,80 @@ def seleccionar_pacientes(db):  # No cachear el DataFrame: scp_codes contiene di
 @st.cache_data(show_spinner="Descargando el ECG seleccionado...")
 def leer_ecg_ptbxl(filename_lr):
     """
-    Lee un registro de PTB-XL desde PhysioNet.
-    Ejemplo filename_lr:
-    records100/00000/00001_lr
+    Descarga y lee un registro de PTB-XL.
+    Descarga el encabezado (.hea) y los datos (.dat) con reintentos,
+    y guarda ambos usando el nombre de registro esperado por WFDB.
     """
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 
-    # Descarga únicamente el encabezado y la señal del registro seleccionado,
-    # no el conjunto completo de PTB-XL. Cada petición tiene timeout.
-    base_url = f"https://physionet.org/files/{PTBXL_BASE}/{filename_lr}"
+    ruta_relativa = str(filename_lr).replace("\\\\", "/").lstrip("/")
+    base_url = f"https://physionet.org/files/{PTBXL_BASE}/{ruta_relativa}"
+    nombre_registro = os.path.basename(ruta_relativa)
+
+    reintentos = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    sesion = requests.Session()
+    sesion.mount("https://", HTTPAdapter(max_retries=reintentos))
+
     try:
         with tempfile.TemporaryDirectory(prefix="ecg_ptbxl_") as temp_dir:
-            local_base = os.path.join(temp_dir, "registro")
+            local_base = os.path.join(temp_dir, nombre_registro)
+
             for extension in (".hea", ".dat"):
-                respuesta = requests.get(base_url + extension, timeout=(8, 30))
+                url = base_url + extension
+                respuesta = sesion.get(url, timeout=(15, 90), stream=True)
                 respuesta.raise_for_status()
-                with open(local_base + extension, "wb") as archivo:
-                    archivo.write(respuesta.content)
+
+                destino = local_base + extension
+                bytes_escritos = 0
+                with open(destino, "wb") as archivo:
+                    for bloque in respuesta.iter_content(chunk_size=1024 * 256):
+                        if bloque:
+                            archivo.write(bloque)
+                            bytes_escritos += len(bloque)
+                respuesta.close()
+
+                if bytes_escritos == 0:
+                    raise IOError(f"PhysioNet devolvió un archivo vacío: {url}")
+
+                # Si hay Content-Length, comprobar que la descarga llegó completa.
+                longitud = respuesta.headers.get("Content-Length")
+                if longitud and bytes_escritos != int(longitud):
+                    raise IOError(
+                        f"Descarga incompleta de {nombre_registro}{extension}: "
+                        f"{bytes_escritos} de {longitud} bytes."
+                    )
+
+            if not os.path.isfile(local_base + ".hea") or not os.path.isfile(local_base + ".dat"):
+                raise FileNotFoundError(
+                    f"No se encontraron el encabezado y los datos de {nombre_registro}."
+                )
+
             record = wfdb.rdrecord(local_base)
+
+        return record.p_signal, record.fs, record.sig_name
+
     except requests.RequestException as exc:
-        st.error(f"No se pudo descargar el registro ECG ({filename_lr}): {exc}")
-        st.info("Comprueba la conexión a Internet o selecciona otro registro más tarde.")
+        st.error(f"No se pudo descargar el ECG {filename_lr} desde PhysioNet: {exc}")
+        st.info(
+            "La señal requiere Internet. Vuelve a intentar o selecciona otro registro. "
+            "Los metadatos sí se leen desde el CSV local."
+        )
         st.stop()
     except Exception as exc:
         st.error(f"No se pudo leer el registro ECG {filename_lr}: {exc}")
+        st.info(
+            "Comprueba que la descarga del registro esté completa. "
+            "Si el problema continúa, prueba con otra señal."
+        )
         st.stop()
-
-    return record.p_signal, record.fs, record.sig_name
 
 
 # ==========================================================
@@ -378,6 +427,12 @@ st.title("Análisis de señales ECG - PTB-XL")
 st.write(
     "Panel interactivo para seleccionar pacientes por sexo, edad y condición, "
     "procesar la señal ECG y generar métricas con alertas visuales."
+)
+
+st.info(
+    "Los metadatos se leen desde el CSV local. La señal ECG (archivo WFDB) "
+    "todavía se consulta en PhysioNet; para trabajar completamente sin Internet "
+    "también debes tener descargada la carpeta de señales records100."
 )
 
 db = cargar_metadatos()
