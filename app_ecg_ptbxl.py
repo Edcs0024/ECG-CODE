@@ -1,5 +1,8 @@
 import ast
 import os
+import io
+import tempfile
+import requests
 import numpy as np
 import pandas as pd
 import wfdb
@@ -24,13 +27,27 @@ st.set_page_config(
 # CARGA DE METADATOS
 # ==========================================================
 
-@st.cache_data
+@st.cache_data(ttl=3600, show_spinner="Descargando metadatos de PTB-XL...")
 def cargar_metadatos():
+    """Descarga solo los dos CSV necesarios y falla con un mensaje claro."""
     url_db = "https://physionet.org/files/ptb-xl/1.0.3/ptbxl_database.csv"
     url_scp = "https://physionet.org/files/ptb-xl/1.0.3/scp_statements.csv"
 
-    db = pd.read_csv(url_db, index_col="ecg_id")
-    scp = pd.read_csv(url_scp, index_col=0)
+    try:
+        with requests.Session() as session:
+            respuesta_db = session.get(url_db, timeout=(8, 25))
+            respuesta_db.raise_for_status()
+            respuesta_scp = session.get(url_scp, timeout=(8, 25))
+            respuesta_scp.raise_for_status()
+        db = pd.read_csv(io.BytesIO(respuesta_db.content), index_col="ecg_id")
+        scp = pd.read_csv(io.BytesIO(respuesta_scp.content), index_col=0)
+    except requests.RequestException as exc:
+        st.error(f"No se pudieron descargar los metadatos de PTB-XL: {exc}")
+        st.info("Comprueba tu conexión a Internet y que PhysioNet sea accesible. La descarga tiene un límite de tiempo; vuelve a ejecutar la aplicación cuando la conexión funcione.")
+        st.stop()
+    except (ValueError, pd.errors.ParserError) as exc:
+        st.error(f"No se pudieron interpretar los CSV de PTB-XL: {exc}")
+        st.stop()
 
     db["scp_codes"] = db["scp_codes"].apply(ast.literal_eval)
 
@@ -76,8 +93,7 @@ def cargar_metadatos():
 # SELECCIÓN AUTOMÁTICA DE PACIENTES
 # ==========================================================
 
-@st.cache_data
-def seleccionar_pacientes(db):
+def seleccionar_pacientes(db):  # No cachear el DataFrame: scp_codes contiene diccionarios no hashables.
     grupos = []
 
     rangos_edad = {
@@ -113,6 +129,7 @@ def seleccionar_pacientes(db):
 # LECTURA DE ECG DESDE PHYSIONET
 # ==========================================================
 
+@st.cache_data(show_spinner="Descargando el ECG seleccionado...")
 def leer_ecg_ptbxl(filename_lr):
     """
     Lee un registro de PTB-XL desde PhysioNet.
@@ -120,18 +137,27 @@ def leer_ecg_ptbxl(filename_lr):
     records100/00000/00001_lr
     """
 
-    carpeta, nombre_registro = filename_lr.rsplit("/", 1)
+    # Descarga únicamente el encabezado y la señal del registro seleccionado,
+    # no el conjunto completo de PTB-XL. Cada petición tiene timeout.
+    base_url = f"https://physionet.org/files/{PTBXL_BASE}/{filename_lr}"
+    try:
+        with tempfile.TemporaryDirectory(prefix="ecg_ptbxl_") as temp_dir:
+            local_base = os.path.join(temp_dir, "registro")
+            for extension in (".hea", ".dat"):
+                respuesta = requests.get(base_url + extension, timeout=(8, 30))
+                respuesta.raise_for_status()
+                with open(local_base + extension, "wb") as archivo:
+                    archivo.write(respuesta.content)
+            record = wfdb.rdrecord(local_base)
+    except requests.RequestException as exc:
+        st.error(f"No se pudo descargar el registro ECG ({filename_lr}): {exc}")
+        st.info("Comprueba la conexión a Internet o selecciona otro registro más tarde.")
+        st.stop()
+    except Exception as exc:
+        st.error(f"No se pudo leer el registro ECG {filename_lr}: {exc}")
+        st.stop()
 
-    record = wfdb.rdrecord(
-        record_name=nombre_registro,
-        pn_dir=f"{PTBXL_BASE}/{carpeta}"
-    )
-
-    ecg = record.p_signal
-    fs = record.fs
-    derivaciones = record.sig_name
-
-    return ecg, fs, derivaciones
+    return record.p_signal, record.fs, record.sig_name
 
 
 # ==========================================================
@@ -356,29 +382,6 @@ st.write(
 
 db = cargar_metadatos()
 seleccion = seleccionar_pacientes(db)
-
-# ==========================================================
-# DESCARGA DEL DATASET COMPLETO EN CSV
-# ==========================================================
-
-st.sidebar.header("Dataset PTB-XL")
-
-@st.cache_data
-def obtener_dataset_completo():
-    url_dataset = "https://physionet.org/files/ptb-xl/1.0.3/ptbxl_database.csv"
-    dataset = pd.read_csv(url_dataset)
-    return dataset
-
-dataset_completo = obtener_dataset_completo()
-
-csv_dataset = dataset_completo.to_csv(index=False).encode("utf-8")
-
-st.sidebar.download_button(
-    label="⬇️ Descargar dataset completo CSV",
-    data=csv_dataset,
-    file_name="ptbxl_dataset_completo.csv",
-    mime="text/csv"
-)
 
 st.sidebar.header("Selección de paciente")
 
