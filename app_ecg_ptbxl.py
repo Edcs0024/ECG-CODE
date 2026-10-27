@@ -9,6 +9,10 @@ import wfdb
 import streamlit as st
 import plotly.graph_objects as go
 from scipy.signal import butter, filtfilt, find_peaks
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import PCA
 
 
 # ==========================================================
@@ -419,6 +423,28 @@ def generar_alertas(metricas, sexo):
 
 
 # ==========================================================
+# MÉTRICAS DE VARIOS REGISTROS PARA K-MEANS
+# ==========================================================
+
+@st.cache_data(show_spinner=False, max_entries=300)
+def metricas_registro_para_cluster(filename_lr, sexo):
+    """Calcula las mismas métricas ECG para un registro, para alimentar K-Means."""
+    ecg, fs, derivaciones = leer_ecg_ptbxl(filename_lr)
+    canal = derivaciones.index("II") if "II" in derivaciones else 0
+    senal = ecg[:, canal]
+    filtrada = filtro_pasabanda(senal, fs)
+    picos = detectar_picos_r(filtrada, fs)
+    sdnn, rmssd, rr_ms = calcular_hrv(picos, fs)
+    latidos, promedio, tiempo = segmentar_latidos(filtrada, picos, fs)
+    if promedio is None:
+        raise ValueError("No se pudieron segmentar latidos")
+    metricas, _ = extraer_metricas(promedio, tiempo, fs, rr_ms, sexo)
+    metricas["SDNN (ms)"] = sdnn
+    metricas["RMSSD (ms)"] = rmssd
+    return metricas
+
+
+# ==========================================================
 # INTERFAZ PRINCIPAL
 # ==========================================================
 
@@ -436,24 +462,44 @@ st.info(
 )
 
 db = cargar_metadatos()
-seleccion = seleccionar_pacientes(db)
 
 st.sidebar.header("Selección de paciente")
+st.sidebar.caption("Escribe el Patient ID que quieras consultar.")
 
-grupo = st.sidebar.selectbox(
-    "Grupo",
-    sorted(seleccion["grupo"].unique())
+patient_ids = sorted(db["patient_id"].dropna().astype(int).unique().tolist())
+patient_id_min = int(min(patient_ids))
+patient_id_max = int(max(patient_ids))
+
+patient_id_elegido = st.sidebar.number_input(
+    "Número de paciente (Patient ID)",
+    min_value=patient_id_min,
+    max_value=patient_id_max,
+    value=patient_id_min,
+    step=1,
+    help="Usa el Patient ID del conjunto PTB-XL; no es lo mismo que el ECG ID."
 )
 
-df_grupo = seleccion[seleccion["grupo"] == grupo]
+filas_paciente = db[db["patient_id"].astype(int) == int(patient_id_elegido)]
 
-paciente_opcion = st.sidebar.selectbox(
-    "Paciente / ECG ID",
-    df_grupo.index.astype(str).tolist()
-)
+if filas_paciente.empty:
+    st.warning(
+        f"El Patient ID {int(patient_id_elegido)} no aparece en los registros "
+        "disponibles. Prueba con otro número dentro del rango mostrado."
+    )
+    st.stop()
 
-ecg_id = int(paciente_opcion)
-fila = df_grupo.loc[ecg_id]
+registros_paciente = sorted(filas_paciente["ecg_id"].astype(int).unique().tolist())
+if len(registros_paciente) > 1:
+    ecg_id = st.sidebar.selectbox(
+        "Registro ECG de este paciente",
+        registros_paciente,
+        help="Un paciente puede tener más de un registro ECG."
+    )
+else:
+    ecg_id = registros_paciente[0]
+    st.sidebar.caption(f"Registro ECG disponible: {ecg_id}")
+
+fila = db.loc[ecg_id]
 
 # Cargar ECG
 ecg, fs, derivaciones = leer_ecg_ptbxl(fila["filename_lr"])
@@ -529,23 +575,55 @@ metricas["Alertas"] = " | ".join(alertas) if alertas else "Sin alertas relevante
 
 
 # ==========================================================
-# SEMÁFORO VISUAL
+# SEMÁFORO COMBINADO: REGLAS + CONTEXTO K-MEANS
 # ==========================================================
 
-st.subheader("Semáforo automático")
+# Se conservan las reglas actuales. K-Means solo puede elevar Verde a Amarillo
+# si detecta un patrón estadísticamente atípico; nunca reduce alertas.
+resultados_kmeans_guardados = st.session_state.get("kmeans_resultados")
+fila_cluster_actual = None
+if isinstance(resultados_kmeans_guardados, pd.DataFrame) and not resultados_kmeans_guardados.empty:
+    coincidencia = resultados_kmeans_guardados[
+        resultados_kmeans_guardados["ECG ID"].astype(int) == int(ecg_id)
+    ]
+    if not coincidencia.empty:
+        fila_cluster_actual = coincidencia.iloc[0]
 
-if semaforo == "Verde":
-    st.success("🟢 Verde: métricas dentro de rangos esperados.")
-elif semaforo == "Amarillo":
-    st.warning("🟡 Amarillo: se recomienda monitoreo o revisión.")
+semaforo_combinado = semaforo
+if (
+    fila_cluster_actual is not None
+    and bool(fila_cluster_actual.get("Patrón estadísticamente atípico", False))
+    and semaforo_combinado == "Verde"
+):
+    semaforo_combinado = "Amarillo"
+
+st.subheader("Semáforo automático combinado")
+
+if semaforo_combinado == "Verde":
+    st.success("🟢 Verde: no hay alertas por reglas y K-Means no marcó este registro como atípico en la muestra analizada.")
+elif semaforo_combinado == "Amarillo":
+    st.warning("🟡 Amarillo: revisar las métricas o el patrón estadístico del registro.")
 else:
-    st.error("🔴 Rojo: posible afección detectada.")
+    st.error("🔴 Rojo: se activaron tres o más alertas basadas en reglas.")
+
+st.caption(
+    f"Semáforo por reglas: {semaforo}. K-Means aporta contexto estadístico, no un diagnóstico. "
+    "Si todavía no ejecutaste K-Means o el registro no está en la muestra, se muestra únicamente el resultado por reglas."
+)
+
+if fila_cluster_actual is not None:
+    st.info(
+        f"Registro ECG {int(ecg_id)}: clúster K-Means "
+        f"{int(fila_cluster_actual['Clúster K-Means'])}. "
+        f"Patrón estadísticamente atípico: "
+        f"{'Sí' if bool(fila_cluster_actual['Patrón estadísticamente atípico']) else 'No'}."
+    )
 
 if alertas:
     for alerta in alertas:
         st.warning(alerta)
 else:
-    st.info("Sin alertas relevantes.")
+    st.info("Sin alertas activadas por las reglas actuales.")
 
 
 # ==========================================================
@@ -700,7 +778,196 @@ st.dataframe(tabla_rangos, use_container_width=True)
 # RESUMEN DE GRUPOS SELECCIONADOS
 # ==========================================================
 
+seleccion = seleccionar_pacientes(db)
 st.subheader("Pacientes seleccionados por grupo")
-
 resumen = seleccion.groupby("grupo").size().reset_index(name="Cantidad")
 st.dataframe(resumen, use_container_width=True)
+
+
+# ==========================================================
+# K-MEANS: AGRUPAMIENTO NO SUPERVISADO DE VARIOS ECG
+# ==========================================================
+
+st.header("Agrupamiento no supervisado con K-Means")
+st.write(
+    "K-Means agrupa registros por similitud entre sus métricas ECG. "
+    "Los grupos son patrones matemáticos y no representan diagnósticos médicos."
+)
+
+col_k1, col_k2 = st.columns(2)
+with col_k1:
+    cantidad_registros = st.slider(
+        "Cantidad de registros para analizar", min_value=12, max_value=100, value=30, step=6,
+        help="Cada registro requiere descargar/procesar la señal si todavía no está en caché."
+    )
+with col_k2:
+    numero_clusters = st.selectbox("Número de clústeres (K)", [2, 3, 4, 5], index=1)
+
+if st.button("Ejecutar K-Means", type="primary"):
+    # Incluir siempre el ECG seleccionado y completar con otros registros.
+    universo = db.reset_index(drop=True).drop_duplicates("ecg_id")
+    registro_actual = universo[universo["ecg_id"].astype(int) == int(ecg_id)].head(1)
+    restantes = universo[universo["ecg_id"].astype(int) != int(ecg_id)]
+    cantidad_restantes = min(max(cantidad_registros - len(registro_actual), 0), len(restantes))
+    restantes = (
+        restantes.sample(n=cantidad_restantes, random_state=42)
+        if cantidad_restantes > 0 else restantes.head(0)
+    )
+    muestra = pd.concat([registro_actual, restantes], ignore_index=True).drop_duplicates("ecg_id")
+    filas_metricas = []
+    errores = []
+    barra = st.progress(0, text="Preparando registros ECG...")
+    for i, (_, registro) in enumerate(muestra.iterrows(), start=1):
+        try:
+            valores = metricas_registro_para_cluster(
+                str(registro["filename_lr"]), str(registro["sexo_texto"])
+            )
+            fila_resultado = {
+                "ECG ID": int(registro["ecg_id"]),
+                "Patient ID": int(registro["patient_id"]),
+                "Edad": int(registro["age"]),
+                "Sexo": registro["sexo_texto"],
+                "Condición dataset": registro["condicion"],
+            }
+            fila_resultado.update(valores)
+            filas_metricas.append(fila_resultado)
+        except Exception as exc:
+            errores.append(f"ECG {registro.get('ecg_id', '?')}: {exc}")
+        barra.progress(i / len(muestra), text=f"Procesando registro {i} de {len(muestra)}...")
+    barra.empty()
+
+    if len(filas_metricas) <= numero_clusters:
+        st.error(
+            f"Solo se pudieron calcular métricas para {len(filas_metricas)} registros. "
+            f"Se necesitan más de {numero_clusters} para formar y evaluar los clústeres. "
+            "Revisa la conexión a PhysioNet o intenta de nuevo."
+        )
+    else:
+        resultados = pd.DataFrame(filas_metricas)
+        columnas_modelo = [
+            "Duración QRS (ms)", "Intervalo QT (ms)", "QTc (ms)",
+            "Amplitud R (mV)", "Duración onda Q (ms)",
+            "Profundidad onda Q (mV)", "Desviación ST (mV)",
+            "SDNN (ms)", "RMSSD (ms)"
+        ]
+        X = resultados[columnas_modelo].replace([np.inf, -np.inf], np.nan)
+        # Evitar imputar datos inventados: se excluyen registros con métricas incompletas.
+        mascara_valida = X.notna().all(axis=1)
+        resultados_validos = resultados.loc[mascara_valida].copy()
+        X = X.loc[mascara_valida]
+
+        if len(X) <= numero_clusters:
+            st.error(
+                "No hay suficientes registros con todas las métricas válidas para este K. "
+                "Aumenta la cantidad de registros o reduce el número de clústeres."
+            )
+        else:
+            escalador = StandardScaler()
+            X_escalado = escalador.fit_transform(X)
+            modelo = KMeans(n_clusters=numero_clusters, random_state=42, n_init=10)
+            etiquetas = modelo.fit_predict(X_escalado)
+            resultados_validos["Clúster K-Means"] = etiquetas
+
+            # Distancia a centroide; atípico significa superar el percentil 95
+            # de las distancias de esta muestra, no una condición médica.
+            distancias = np.linalg.norm(
+                X_escalado - modelo.cluster_centers_[etiquetas], axis=1
+            )
+            umbral_atipico = float(np.percentile(distancias, 95))
+            resultados_validos["Distancia al centroide"] = distancias
+            resultados_validos["Patrón estadísticamente atípico"] = distancias > umbral_atipico
+            st.session_state["kmeans_resultados"] = resultados_validos.copy()
+            st.session_state["kmeans_umbral_atipico"] = umbral_atipico
+            st.session_state["kmeans_numero_clusters"] = numero_clusters
+
+            grupos_presentes = len(np.unique(etiquetas))
+            if grupos_presentes > 1 and grupos_presentes < len(etiquetas):
+                silueta = silhouette_score(X_escalado, etiquetas)
+                st.metric("Silhouette score", f"{silueta:.3f}")
+                st.caption(
+                    "El silhouette score va aproximadamente de -1 a 1; valores mayores suelen "
+                    "indicar grupos mejor separados. Interprétalo como una medida matemática, no clínica."
+                )
+            else:
+                st.info("No se pudo calcular silhouette score porque el agrupamiento produjo una sola etiqueta o grupos no evaluables.")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Cantidad de registros por clúster")
+                conteos = resultados_validos["Clúster K-Means"].value_counts().sort_index()
+                st.bar_chart(conteos)
+            with c2:
+                st.subheader("Proyección visual de los grupos")
+                if X_escalado.shape[1] >= 2:
+                    componentes = PCA(n_components=2, random_state=42).fit_transform(X_escalado)
+                    grafica = pd.DataFrame({
+                        "Componente 1": componentes[:, 0],
+                        "Componente 2": componentes[:, 1],
+                        "Clúster": etiquetas.astype(str),
+                    })
+                    fig_cluster = go.Figure()
+                    for etiqueta in sorted(grafica["Clúster"].unique()):
+                        sub = grafica[grafica["Clúster"] == etiqueta]
+                        fig_cluster.add_trace(go.Scatter(
+                            x=sub["Componente 1"], y=sub["Componente 2"],
+                            mode="markers", name=f"Clúster {etiqueta}",
+                            text=[f"Clúster {etiqueta}" for _ in range(len(sub))],
+                        ))
+                    fig_cluster.update_layout(
+                        xaxis_title="Componente principal 1",
+                        yaxis_title="Componente principal 2", height=420
+                    )
+                    st.plotly_chart(fig_cluster, use_container_width=True)
+
+            st.subheader("Semáforo combinado del ECG seleccionado")
+            coincidencia_actual = resultados_validos[
+                resultados_validos["ECG ID"].astype(int) == int(ecg_id)
+            ]
+            if not coincidencia_actual.empty:
+                datos_actuales = coincidencia_actual.iloc[0]
+                semaforo_final = semaforo
+                es_atipico_actual = bool(datos_actuales["Patrón estadísticamente atípico"])
+                if es_atipico_actual and semaforo_final == "Verde":
+                    semaforo_final = "Amarillo"
+
+                if semaforo_final == "Verde":
+                    st.success("🟢 Verde: sin alertas por reglas ni atipicidad estadística detectada en esta muestra.")
+                elif semaforo_final == "Amarillo":
+                    st.warning("🟡 Amarillo: hay alertas por reglas o el registro es estadísticamente atípico.")
+                else:
+                    st.error("🔴 Rojo: tres o más alertas por reglas; K-Means no modifica este estado.")
+
+                st.write({
+                    "ECG ID seleccionado": int(ecg_id),
+                    "Clúster K-Means": int(datos_actuales["Clúster K-Means"]),
+                    "Distancia al centroide": round(float(datos_actuales["Distancia al centroide"]), 3),
+                    "Umbral estadístico (percentil 95)": round(umbral_atipico, 3),
+                    "Patrón estadísticamente atípico": "Sí" if es_atipico_actual else "No",
+                    "Semáforo por reglas": semaforo,
+                    "Semáforo combinado": semaforo_final
+                })
+            else:
+                st.info("El ECG seleccionado no tuvo métricas válidas y no se pudo combinar su clúster con el semáforo.")
+
+            st.subheader("Registros y clúster asignado")
+            columnas_resultado = [
+                "ECG ID", "Patient ID", "Edad", "Sexo", "Condición dataset",
+                "Clúster K-Means", "Distancia al centroide",
+                "Patrón estadísticamente atípico"
+            ] + columnas_modelo
+            st.dataframe(resultados_validos[columnas_resultado], use_container_width=True)
+            st.download_button(
+                "Descargar resultados K-Means (CSV)",
+                data=resultados_validos.to_csv(index=False).encode("utf-8-sig"),
+                file_name="resultados_kmeans_ecg.csv",
+                mime="text/csv"
+            )
+            if errores:
+                with st.expander(f"Registros omitidos por error ({len(errores)})"):
+                    st.write("Algunos registros no pudieron procesarse. No se incluyeron en el agrupamiento.")
+                    st.code("\n".join(errores[:30]))
+            st.warning(
+                "Los clústeres son identificadores arbitrarios. El indicador atípico se basa en la "
+                "distancia al centroide respecto al percentil 95 de esta muestra; no equivale a riesgo "
+                "clínico ni a un diagnóstico. El rojo depende únicamente de las reglas existentes."
+            )
